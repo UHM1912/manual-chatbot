@@ -170,14 +170,14 @@ If the answer is not present, clearly say so.
                 "confidence": "Low"
             }
 
-# =========================
-# GENERATE ANSWER
-# =========================
-context = "\n\n".join(d.page_content for d in docs)
-context = context[:12000]  # prevent Groq overflow
-
-prompt = self.build_prompt(context, query)
-response = self.llm.invoke(prompt)
+            # =========================
+            # GENERATE ANSWER
+            # =========================
+            context = "\n\n".join(d.page_content for d in docs)
+            context = context[:12000]  # prevent Groq overflow
+            
+            prompt = self.build_prompt(context, query)
+            response = self.llm.invoke(prompt)
 
         return response.content, {
             "model": self.last_model,
