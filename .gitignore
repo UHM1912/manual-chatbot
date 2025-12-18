@@ -1,0 +1,19 @@
+# virtual environments
+.venv/
+venv/
+env/
+
+# python
+__pycache__/
+*.pyc
+
+# streamlit
+.streamlit/
+
+# faiss index (optional – remove if you want to track it)
+vector_store/*.faiss
+vector_store/*.pkl
+
+# OS
+.DS_Store
+Thumbs.db
