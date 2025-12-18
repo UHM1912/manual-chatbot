@@ -1,9 +1,10 @@
 from pathlib import Path
+import os
+
 from langchain_community.vectorstores import FAISS
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_core.messages import HumanMessage
 from langchain_groq import ChatGroq
-import os
 
 from build_vector_store import build_vector_store
 
@@ -22,6 +23,7 @@ def confidence_from_distance(score: float):
         return "Medium"
     else:
         return "Low"
+
 
 # =========================
 # MODEL & CATEGORY HELPERS
@@ -63,25 +65,18 @@ MODEL_MAP = {
 
 def detect_category(query: str):
     q = query.lower()
-
-    if "car" in q or "car system" in q or "stereo" in q:
+    if "car" in q:
         return "carsystem"
-
-    if "airconditioner" in q or "air conditioner" in q or "ac" in q:
+    if "air conditioner" in q or "ac" in q:
         return "airconditioner"
-
-    if "microwave" in q or "oven" in q:
+    if "microwave" in q:
         return "microwave"
-
     if "printer" in q:
         return "printer"
-
-    if "headphone" in q or "earphone" in q:
+    if "headphone" in q:
         return "headphones"
-
     if "projector" in q:
         return "projector"
-
     return None
 
 
@@ -97,40 +92,30 @@ class ChatbotEngine:
             model_name="sentence-transformers/all-MiniLM-L6-v2"
         )
 
+        # ✅ Build FAISS if missing (Cloud-safe)
+        if not VECTOR_DIR.exists() or not (VECTOR_DIR / "index.faiss").exists():
+            print("⚠️ FAISS not found. Building...")
+            build_vector_store()
 
+        self.vectorstore = FAISS.load_local(
+            VECTOR_DIR,
+            self.embeddings,
+            allow_dangerous_deserialization=True
+        )
 
-        try:
-            self.vectorstore = FAISS.load_local(
-                VECTOR_DIR,
-                self.embeddings,
-                allow_dangerous_deserialization=True
-            )
-            print("✅ FAISS index loaded")
-
-        except Exception as e:
-            print("⚠️ FAISS load failed, rebuilding index...")
-            print(e)
-
-            self.vectorstore = build_vector_store(
-                persist_dir=VECTOR_DIR,
-                embeddings=self.embeddings
-            )
-
-
+        print("✅ FAISS loaded")
 
         self.llm = ChatGroq(
-    model="llama3-70b-8192",
-    temperature=0,
-    api_key=os.environ["GROQ_API_KEY"]
-)
-
+            model="llama3-70b-8192",
+            temperature=0,
+            api_key=os.environ["GROQ_API_KEY"]
+        )
 
     # -------------------------
     def build_prompt(self, context, question):
         return f"""
-Do not explain your reasoning.
 You are a helpful technical assistant.
-Answer the question using ONLY the information below.
+Answer using ONLY the context below.
 
 Context:
 {context}
@@ -138,115 +123,55 @@ Context:
 Question:
 {question}
 
-If the answer is not present in the context:
-- Clearly state that the information is not explicitly available
-- Briefly explain why (e.g., manual scope or model mismatch)
-- Do NOT repeat the sentence verbatim
-- Do NOT explain your reasoning process
-
+If the answer is not present, clearly say so.
 """
 
     # -------------------------
     def answer(self, query: str):
-        """
-        Main entry point for UI.
-        Returns:
-          answer_text (str),
-          meta (dict): current model/category
-        """
-
         detected_model = detect_model(query)
         detected_category = detect_category(query)
-        results = []
-        # =========================
-        # CONTEXT SWITCHING LOGIC
-        # =========================
-        if detected_model and detected_model in MODEL_MAP:
-            # Exact model mentioned
-            active_model = MODEL_MAP[detected_model]
-            self.last_model = active_model
-            self.last_category = None
 
+        if detected_model and detected_model in MODEL_MAP:
+            self.last_model = MODEL_MAP[detected_model]
+            self.last_category = None
             results = self.vectorstore.similarity_search_with_score(
-                query, k=TOP_K, filter={"model": active_model}
+                query, k=TOP_K, filter={"model": self.last_model}
             )
 
         elif detected_category:
-            # Category switch (new product type)
             self.last_category = detected_category
             self.last_model = None
-
             results = self.vectorstore.similarity_search_with_score(
                 query, k=TOP_K, filter={"category": detected_category}
             )
 
         elif self.last_model:
-            # Follow-up question
-            active_model = self.last_model
-
             results = self.vectorstore.similarity_search_with_score(
-                query, k=TOP_K, filter={"model": active_model}
+                query, k=TOP_K, filter={"model": self.last_model}
             )
 
         else:
-            # Global search fallback
-            results = self.vectorstore.similarity_search_with_score(
-                query, k=TOP_K
-            )
+            results = self.vectorstore.similarity_search_with_score(query, k=TOP_K)
 
         if not results:
-            return (
-                "I could not find this information in the manual.",
-                {
-                    "model": self.last_model,
-                    "category": self.last_category
-                }
-            )
+            return "I could not find this information in the manual.", {}
 
-        # =========================
-        # FILTER BY CONFIDENCE
-        # =========================
-        docs = []
-        best_score = None
-
+        docs, best_score = [], None
         for doc, score in results:
-            if best_score is None or score < best_score:
-                best_score = score
+            best_score = score if best_score is None else min(best_score, score)
             if score < DISTANCE_THRESHOLD:
                 docs.append(doc)
-          
-    # =========================
-    # NOTHING CONFIDENT ENOUGH
-    # =========================
+
         if not docs:
-            return (
-                "I could not find this information in the manual.",
-                {
-                    "model": self.last_model,
-                    "category": self.last_category,
-                    "confidence": "Low"
-                }
-            )
-
-        # =========================
-        # GENERATE ANSWER
-        # =========================
-        context = "\n\n".join(d.page_content for d in docs)
-        prompt = self.build_prompt(context, query)
-        response = self.llm.invoke([HumanMessage(content=prompt)])
-         
-        if best_score < 0.7:
-            confidence = "High"
-        elif best_score < 1.0:
-            confidence = "Medium"
-        else:
-            confidence = "Low"
-
-        return (
-            response.content,
-            {
-                "model": self.last_model,
-                "category": self.last_category,
-                "confidence": confidence
+            return "I could not find this information in the manual.", {
+                "confidence": "Low"
             }
-        )
+
+        context = "\n\n".join(d.page_content for d in docs)
+        response = self.llm.invoke([HumanMessage(content=self.build_prompt(context, query))])
+
+        return response.content, {
+            "model": self.last_model,
+            "category": self.last_category,
+            "confidence": confidence_from_distance(best_score)
+        }
