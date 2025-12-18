@@ -26,8 +26,9 @@ class ChatbotEngine:
 
         # ✅ GROQ LLM
         self.llm = ChatGroq(
-            model_name="llama3-70b-8192",
-            temperature=0
+            model_name="llama3-8b-8192",
+            temperature=0,
+            max_tokens=512
         )
 
     def build_prompt(self, context, question):
@@ -67,12 +68,24 @@ If the answer is not present in the context:
                 "confidence": "Low"
             }
 
-        context = "\n\n".join(d.page_content for d in docs)
+        MAX_CHARS = 6000  # safe for llama3-8b
+
+        context_parts = []
+        total_chars = 0
+        
+        for d in docs:
+            chunk = d.page_content
+            if total_chars + len(chunk) > MAX_CHARS:
+                break
+            context_parts.append(chunk)
+            total_chars += len(chunk)
+        
+        context = "\n\n".join(context_parts)
+
         prompt = self.build_prompt(context, query)
 
-        response = self.llm.invoke(
-            [HumanMessage(content=prompt)]
-        )
+       response = self.llm.invoke(prompt)
+
 
         if best_score < 0.7:
             confidence = "High"
