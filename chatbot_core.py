@@ -10,9 +10,8 @@ from groq import Groq
 # CONFIG
 # =========================
 VECTOR_DIR = Path("vector_store")
-TOP_K = 6
-DISTANCE_THRESHOLD = 1.3
-MAX_CONTEXT_CHARS = 6000   # hard safety limit for Groq
+TOP_K = 5
+MAX_CONTEXT_CHARS = 4000   # Groq-safe limit
 
 
 # =========================
@@ -20,23 +19,18 @@ MAX_CONTEXT_CHARS = 6000   # hard safety limit for Groq
 # =========================
 class ChatbotEngine:
     def __init__(self):
-        self.last_model = None
-        self.last_category = None
-
-        # --- sanity check ---
+        # --- API key check ---
         if not os.getenv("GROQ_API_KEY"):
             raise RuntimeError("GROQ_API_KEY is not set")
 
-        # --- embeddings ---
+        # --- Embeddings ---
         self.embeddings = HuggingFaceEmbeddings(
             model_name="sentence-transformers/all-MiniLM-L6-v2"
         )
 
         # --- FAISS ---
         if not (VECTOR_DIR / "index.faiss").exists():
-            raise RuntimeError(
-                "FAISS index not found. Make sure vector_store/index.faiss exists."
-            )
+            raise RuntimeError("FAISS index not found in vector_store/")
 
         self.vectorstore = FAISS.load_local(
             VECTOR_DIR,
@@ -44,76 +38,60 @@ class ChatbotEngine:
             allow_dangerous_deserialization=True
         )
 
-        # --- GROQ CLIENT (DIRECT, STABLE) ---
+        # --- Groq client (DIRECT, no LangChain chat adapter) ---
         self.groq_client = Groq(
             api_key=os.environ.get("GROQ_API_KEY")
         )
 
     # -------------------------
     def build_prompt(self, context: str, question: str) -> str:
-        return f"""
-You are a helpful technical assistant.
-
-Answer the question using ONLY the information provided in the context.
-
-Context:
-{context}
-
-Question:
-{question}
-
-If the answer is not explicitly present in the context:
-- Say that the information is not available in the manual
-- Briefly explain why
-"""
+        # ❗ No triple quotes, no leading newline (Groq-safe)
+        return (
+            "You are a helpful technical assistant.\n\n"
+            "Answer the question using ONLY the information provided in the context.\n\n"
+            f"Context:\n{context}\n\n"
+            f"Question:\n{question}\n\n"
+            "If the answer is not explicitly present in the context, say so clearly."
+        )
 
     # -------------------------
     def answer(self, query: str):
-        """
-        Main entry point for Streamlit UI
-        Returns:
-            answer_text (str),
-            meta (dict)
-        """
-
-        # --- retrieve ---
+        # --- Retrieve ---
         results = self.vectorstore.similarity_search_with_score(
             query, k=TOP_K
         )
 
         if not results:
-            return (
-                "I could not find this information in the manual.",
-                {"confidence": "Low"}
-            )
+            return "I could not find this information in the manual.", {
+                "confidence": "Low"
+            }
 
-        # --- filter by distance ---
-       # Take top-k results directly (do NOT hard-filter by distance)
+        # --- IMPORTANT FIX ---
+        # Take top-k results directly (NO distance threshold filtering)
         docs = [doc for doc, _ in results[:3]]
         best_score = min(score for _, score in results[:3])
 
-
-        if not docs:
-            return (
-                "I could not find this information in the manual.",
-                {"confidence": "Low"}
-            )
-
-        # --- build SAFE context ---
+        # --- Build context safely ---
         context_parts = []
         total_chars = 0
 
         for d in docs:
-            chunk = d.page_content
+            chunk = d.page_content.strip()
             if total_chars + len(chunk) > MAX_CONTEXT_CHARS:
                 break
             context_parts.append(chunk)
             total_chars += len(chunk)
 
         context = "\n\n".join(context_parts)
+
+        if not context.strip():
+            return "I could not find this information in the manual.", {
+                "confidence": "Low"
+            }
+
         prompt = self.build_prompt(context, query)
 
-        # --- call GROQ directly ---
+        # --- Call Groq ---
         try:
             completion = self.groq_client.chat.completions.create(
                 model="llama3-8b-8192",
@@ -127,15 +105,16 @@ If the answer is not explicitly present in the context:
                 max_tokens=512,
             )
 
-            answer_text = completion.choices[0].message.content
+            answer_text = completion.choices[0].message.content.strip()
 
-        except Exception:
-            return (
-                "I could not generate an answer at the moment.",
-                {"confidence": "Low"}
-            )
+        except Exception as e:
+            # Log real Groq error in Streamlit logs
+            print("GROQ ERROR:", e)
+            return "I could not generate an answer at the moment.", {
+                "confidence": "Low"
+            }
 
-        # --- confidence ---
+        # --- Confidence (soft heuristic) ---
         if best_score < 0.7:
             confidence = "High"
         elif best_score < 1.0:
