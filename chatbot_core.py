@@ -130,8 +130,27 @@ class ChatbotEngine:
         docs = [doc for doc, _ in results[:3]]
         best_score = min(score for _, score in results[:3])
 
-        context = "\n\n".join(d.page_content for d in docs)
-        context = context[:MAX_CONTEXT_CHARS]
+        context_parts = []
+        total_chars = 0
+        
+        for d in docs:
+            chunk = d.page_content.strip()
+            if not chunk:
+                continue
+            if total_chars + len(chunk) > MAX_CONTEXT_CHARS:
+                break
+            context_parts.append(chunk)
+            total_chars += len(chunk)
+        
+        context = "\n\n".join(context_parts)
+        
+        # 🔴 VERY IMPORTANT GUARD
+        if not context.strip():
+            return (
+                "The manual does not contain relevant information for this question.",
+                {"confidence": "Low"}
+            )
+
 
         prompt = self.build_prompt(context, query)
 
@@ -142,7 +161,7 @@ class ChatbotEngine:
                 {"role": "user", "content": prompt}
             ],
             temperature=0,
-            max_tokens=512
+            max_tokens=384
         )
 
         answer_text = completion.choices[0].message.content.strip()
