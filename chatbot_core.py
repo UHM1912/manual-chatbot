@@ -3,7 +3,6 @@ import os
 
 from langchain_community.vectorstores import FAISS
 from langchain_huggingface import HuggingFaceEmbeddings
-from langchain_core.messages import HumanMessage
 from langchain_groq import ChatGroq
 
 from build_vector_store import build_vector_store
@@ -18,11 +17,11 @@ DISTANCE_THRESHOLD = 1.3
 
 
 # =========================
-# HELPERS
+# MODEL / CATEGORY HELPERS
 # =========================
 def detect_model(query: str):
     q = query.lower()
-    models = [
+    known_models = [
         "neopix 110", "neopix 750",
         "hc210",
         "1000 series", "2000 series", "4000 series",
@@ -31,7 +30,7 @@ def detect_model(query: str):
         "lw5025r",
         "cmb110055", "rc759"
     ]
-    for m in models:
+    for m in known_models:
         if m in q:
             return m.replace(" ", "_")
     return None
@@ -57,7 +56,7 @@ MODEL_MAP = {
 
 def detect_category(query: str):
     q = query.lower()
-    if "car" in q or "stereo" in q:
+    if "car" in q:
         return "carsystem"
     if "air conditioner" in q or "ac" in q:
         return "airconditioner"
@@ -80,19 +79,19 @@ class ChatbotEngine:
         self.last_model = None
         self.last_category = None
 
-        # ---- embeddings ----
+        # ---------- Embeddings ----------
         self.embeddings = HuggingFaceEmbeddings(
             model_name="sentence-transformers/all-MiniLM-L6-v2"
         )
 
-        # ---- FAISS ----
+        # ---------- Vector Store ----------
         try:
             self.vectorstore = FAISS.load_local(
                 VECTOR_DIR,
                 self.embeddings,
                 allow_dangerous_deserialization=True
             )
-            print("✅ FAISS loaded")
+            print("✅ FAISS index loaded")
 
         except Exception:
             print("⚠️ FAISS not found → rebuilding")
@@ -101,21 +100,22 @@ class ChatbotEngine:
                 embeddings=self.embeddings
             )
 
-        # ---- Groq LLM ----
-        if "GROQ_API_KEY" not in os.environ:
+        # ---------- GROQ ----------
+        api_key = os.getenv("GROQ_API_KEY")
+        if not api_key:
             raise RuntimeError("GROQ_API_KEY not set in environment")
 
         self.llm = ChatGroq(
-            model="llama3-70b-8192",
+            model="llama3-8b-8192",
             temperature=0,
-            api_key=os.environ["GROQ_API_KEY"]
+            api_key=api_key
         )
 
     # -------------------------
     def build_prompt(self, context, question):
         return f"""
-You are a helpful technical assistant.
-Answer using ONLY the context below.
+You are a professional technical assistant.
+Answer ONLY using the information below.
 
 Context:
 {context}
@@ -123,7 +123,8 @@ Context:
 Question:
 {question}
 
-If the answer is not explicitly available, say so clearly.
+If the answer is not explicitly present:
+Say that the manual does not contain this information.
 """
 
     # -------------------------
@@ -131,7 +132,7 @@ If the answer is not explicitly available, say so clearly.
         detected_model = detect_model(query)
         detected_category = detect_category(query)
 
-        # ---- context selection ----
+        # ---------- Retrieval ----------
         if detected_model and detected_model in MODEL_MAP:
             self.last_model = MODEL_MAP[detected_model]
             self.last_category = None
@@ -159,30 +160,32 @@ If the answer is not explicitly available, say so clearly.
         if not results:
             return "I could not find this information in the manual.", {}
 
+        # ---------- Confidence filtering ----------
         docs = []
-        best_score = None
+        best_score = min(score for _, score in results)
 
         for doc, score in results:
-            best_score = score if best_score is None else min(best_score, score)
             if score < DISTANCE_THRESHOLD:
                 docs.append(doc)
 
         if not docs:
             return "I could not find this information in the manual.", {}
 
+        # ---------- LLM ----------
         context = "\n\n".join(d.page_content for d in docs)
-        response = self.llm.invoke(
-            [HumanMessage(content=self.build_prompt(context, query))]
-        )
+        prompt = self.build_prompt(context, query)
 
-        confidence = (
-            "High" if best_score < 0.7
-            else "Medium" if best_score < 1.0
-            else "Low"
-        )
+        try:
+            response = self.llm.invoke(prompt)
+        except Exception as e:
+            return f"LLM error: {str(e)}", {}
 
         return response.content, {
             "model": self.last_model,
             "category": self.last_category,
-            "confidence": confidence
+            "confidence": (
+                "High" if best_score < 0.7 else
+                "Medium" if best_score < 1.0 else
+                "Low"
+            )
         }
