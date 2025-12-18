@@ -4,6 +4,7 @@ from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_groq import ChatGroq
 from langchain_core.messages import HumanMessage
 import os
+import streamlit as st
 
 # =========================
 # CONFIG
@@ -14,6 +15,10 @@ DISTANCE_THRESHOLD = 1.3
 
 # Groq API key from environment
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+
+if not GROQ_API_KEY:
+    st.error("❌ GROQ_API_KEY not found. Please set it in Streamlit secrets or environment variables.")
+    st.stop()
 
 
 def confidence_from_distance(score: float):
@@ -104,18 +109,21 @@ class ChatbotEngine:
             allow_dangerous_deserialization=True
         )
 
-        # Initialize Groq LLM
-        self.llm = ChatGroq(
-            model="mixtral-8x7b-32768",  # or "llama2-70b-4096", "gemma-7b-it"
-            temperature=0,
-            api_key=GROQ_API_KEY
-        )
+        # Initialize Groq LLM with error handling
+        try:
+            self.llm = ChatGroq(
+                model="mixtral-8x7b-32768",
+                temperature=0,
+                api_key=GROQ_API_KEY,
+                timeout=30
+            )
+        except Exception as e:
+            st.error(f"Failed to initialize Groq: {str(e)}")
+            st.stop()
 
     # -------------------------
     def build_prompt(self, context, question):
-        return f"""
-Do not explain your reasoning.
-You are a helpful technical assistant.
+        return f"""You are a helpful technical assistant.
 Answer the question using ONLY the information below.
 
 Context:
@@ -124,13 +132,8 @@ Context:
 Question:
 {question}
 
-If the answer is not present in the context:
-- Clearly state that the information is not explicitly available
-- Briefly explain why (e.g., manual scope or model mismatch)
-- Do NOT repeat the sentence verbatim
-- Do NOT explain your reasoning process
-
-"""
+If the answer is not present in the context, state that clearly.
+Keep your response concise and direct."""
 
     # -------------------------
     def answer(self, query: str):
@@ -144,6 +147,7 @@ If the answer is not present in the context:
         detected_model = detect_model(query)
         detected_category = detect_category(query)
         results = []
+        
         # =========================
         # CONTEXT SWITCHING LOGIC
         # =========================
@@ -185,7 +189,8 @@ If the answer is not present in the context:
                 "I could not find this information in the manual.",
                 {
                     "model": self.last_model,
-                    "category": self.last_category
+                    "category": self.last_category,
+                    "confidence": "Low"
                 }
             )
 
@@ -217,22 +222,70 @@ If the answer is not present in the context:
         # =========================
         # GENERATE ANSWER
         # =========================
-        context = "\n\n".join(d.page_content for d in docs)
-        prompt = self.build_prompt(context, query)
-        response = self.llm.invoke([HumanMessage(content=prompt)])
-         
-        if best_score < 0.7:
-            confidence = "High"
-        elif best_score < 1.0:
-            confidence = "Medium"
-        else:
-            confidence = "Low"
+        try:
+            context = "\n\n".join(d.page_content for d in docs)
+            
+            # Truncate context if too long (Groq has token limits)
+            max_context_length = 3000
+            if len(context) > max_context_length:
+                context = context[:max_context_length] + "..."
+            
+            prompt = self.build_prompt(context, query)
+            response = self.llm.invoke([HumanMessage(content=prompt)])
+            
+            if best_score < 0.7:
+                confidence = "High"
+            elif best_score < 1.0:
+                confidence = "Medium"
+            else:
+                confidence = "Low"
 
-        return (
-            response.content,
-            {
-                "model": self.last_model,
-                "category": self.last_category,
-                "confidence": confidence
-            }
-        )
+            return (
+                response.content,
+                {
+                    "model": self.last_model,
+                    "category": self.last_category,
+                    "confidence": confidence
+                }
+            )
+        
+        except Exception as e:
+            error_msg = str(e)
+            
+            # Handle specific error types
+            if "401" in error_msg or "unauthorized" in error_msg.lower():
+                return (
+                    "❌ API authentication failed. Check your GROQ_API_KEY.",
+                    {
+                        "model": self.last_model,
+                        "category": self.last_category,
+                        "confidence": "Low"
+                    }
+                )
+            elif "429" in error_msg:
+                return (
+                    "⏳ Rate limit reached. Please try again in a moment.",
+                    {
+                        "model": self.last_model,
+                        "category": self.last_category,
+                        "confidence": "Low"
+                    }
+                )
+            elif "500" in error_msg or "503" in error_msg:
+                return (
+                    "🔧 Groq service temporarily unavailable. Please try again.",
+                    {
+                        "model": self.last_model,
+                        "category": self.last_category,
+                        "confidence": "Low"
+                    }
+                )
+            else:
+                return (
+                    f"⚠️ Error: {error_msg[:100]}",
+                    {
+                        "model": self.last_model,
+                        "category": self.last_category,
+                        "confidence": "Low"
+                    }
+                )
