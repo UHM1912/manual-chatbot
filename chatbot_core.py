@@ -1,8 +1,11 @@
 from pathlib import Path
 from langchain_community.vectorstores import FAISS
 from langchain_huggingface import HuggingFaceEmbeddings
-from langchain_community.chat_models import ChatOllama
 from langchain_core.messages import HumanMessage
+from langchain_groq import ChatGroq
+import os
+
+from build_vector_store import build_vector_store
 
 # =========================
 # CONFIG
@@ -94,13 +97,33 @@ class ChatbotEngine:
             model_name="sentence-transformers/all-MiniLM-L6-v2"
         )
 
-        self.vectorstore = FAISS.load_local(
-            VECTOR_DIR,
-            self.embeddings,
-            allow_dangerous_deserialization=True
-        )
 
-        self.llm = ChatOllama(model="llama3", temperature=0)
+
+        try:
+            self.vectorstore = FAISS.load_local(
+                VECTOR_DIR,
+                self.embeddings,
+                allow_dangerous_deserialization=True
+            )
+            print("✅ FAISS index loaded")
+
+        except Exception as e:
+            print("⚠️ FAISS load failed, rebuilding index...")
+            print(e)
+
+            self.vectorstore = build_vector_store(
+                persist_dir=VECTOR_DIR,
+                embeddings=self.embeddings
+            )
+
+
+
+        self.llm = ChatGroq(
+    model="llama3-70b-8192",
+    temperature=0,
+    api_key=os.environ["GROQ_API_KEY"]
+)
+
 
     # -------------------------
     def build_prompt(self, context, question):
