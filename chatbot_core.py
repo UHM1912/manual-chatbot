@@ -8,25 +8,35 @@ from langchain_groq import ChatGroq
 
 from build_vector_store import build_vector_store
 
+
 # =========================
 # CONFIG
 # =========================
 VECTOR_DIR = Path("vector_store")
 TOP_K = 6
 DISTANCE_THRESHOLD = 1.3
+MAX_CONTEXT_CHARS = 12000  # safe for Groq
 
 
-def confidence_from_distance(score: float):
+# =========================
+# UTILS
+# =========================
+def trim_context(text: str) -> str:
+    if len(text) <= MAX_CONTEXT_CHARS:
+        return text
+    return text[:MAX_CONTEXT_CHARS]
+
+
+def confidence_from_score(score: float) -> str:
     if score < 0.7:
         return "High"
     elif score < 1.0:
         return "Medium"
-    else:
-        return "Low"
+    return "Low"
 
 
 # =========================
-# MODEL & CATEGORY HELPERS
+# MODEL & CATEGORY DETECTION
 # =========================
 def detect_model(query: str):
     q = query.lower()
@@ -65,18 +75,20 @@ MODEL_MAP = {
 
 def detect_category(query: str):
     q = query.lower()
-    if "car" in q:
+
+    if "car" in q or "stereo" in q:
         return "carsystem"
-    if "air conditioner" in q or "ac" in q:
+    if "air conditioner" in q or "airconditioner" in q or "ac" in q:
         return "airconditioner"
-    if "microwave" in q:
+    if "microwave" in q or "oven" in q:
         return "microwave"
     if "printer" in q:
         return "printer"
-    if "headphone" in q:
+    if "headphone" in q or "earphone" in q:
         return "headphones"
     if "projector" in q:
         return "projector"
+
     return None
 
 
@@ -88,62 +100,61 @@ class ChatbotEngine:
         self.last_model = None
         self.last_category = None
 
+        # Embeddings
         self.embeddings = HuggingFaceEmbeddings(
             model_name="sentence-transformers/all-MiniLM-L6-v2"
         )
 
-        # ✅ Build FAISS if missing (Cloud-safe)
-        if not VECTOR_DIR.exists() or not (VECTOR_DIR / "index.faiss").exists():
-            print("⚠️ FAISS not found. Building...")
-            build_vector_store()
+        # Vector store
+        try:
+            self.vectorstore = FAISS.load_local(
+                VECTOR_DIR,
+                self.embeddings,
+                allow_dangerous_deserialization=True
+            )
+            print("✅ FAISS index loaded")
+        except Exception as e:
+            print("⚠️ FAISS not found, rebuilding index...")
+            print(e)
+            self.vectorstore = build_vector_store(
+                persist_dir=VECTOR_DIR,
+                embeddings=self.embeddings
+            )
 
-        self.vectorstore = FAISS.load_local(
-            VECTOR_DIR,
-            self.embeddings,
-            allow_dangerous_deserialization=True
-        )
-
-        print("✅ FAISS loaded")
+        # Groq LLM
+        groq_key = os.getenv("GROQ_API_KEY")
+        if not groq_key:
+            raise RuntimeError("GROQ_API_KEY environment variable not set")
 
         self.llm = ChatGroq(
             model="llama3-70b-8192",
             temperature=0,
-            api_key=os.environ["GROQ_API_KEY"]
+            api_key=groq_key
         )
-MAX_CONTEXT_CHARS = 12000  # safe for Groq
 
-context = context[:MAX_CONTEXT_CHARS]
-
-    # -------------------------
-    def build_prompt(self, context, question):
-                return f"""
-        You are a helpful technical assistant.
-        Answer using ONLY the context below.
-        
-        Context:
-        {context}
-        
-        Question:
-        {question}
-        
-        If the answer is not present, clearly say so.
-        """
-
-    # -------------------------
+    # =========================
+    # ANSWER
+    # =========================
     def answer(self, query: str):
         detected_model = detect_model(query)
         detected_category = detect_category(query)
 
+        # -------------------------
+        # Context switching
+        # -------------------------
         if detected_model and detected_model in MODEL_MAP:
-            self.last_model = MODEL_MAP[detected_model]
+            active_model = MODEL_MAP[detected_model]
+            self.last_model = active_model
             self.last_category = None
+
             results = self.vectorstore.similarity_search_with_score(
-                query, k=TOP_K, filter={"model": self.last_model}
+                query, k=TOP_K, filter={"model": active_model}
             )
 
         elif detected_category:
             self.last_category = detected_category
             self.last_model = None
+
             results = self.vectorstore.similarity_search_with_score(
                 query, k=TOP_K, filter={"category": detected_category}
             )
@@ -154,12 +165,23 @@ context = context[:MAX_CONTEXT_CHARS]
             )
 
         else:
-            results = self.vectorstore.similarity_search_with_score(query, k=TOP_K)
+            results = self.vectorstore.similarity_search_with_score(
+                query, k=TOP_K
+            )
 
         if not results:
-            return "I could not find this information in the manual.", {}
+            return "I could not find this information in the manual.", {
+                "model": self.last_model,
+                "category": self.last_category,
+                "confidence": "Low"
+            }
 
-        docs, best_score = [], None
+        # -------------------------
+        # Filter confident docs
+        # -------------------------
+        docs = []
+        best_score = None
+
         for doc, score in results:
             best_score = score if best_score is None else min(best_score, score)
             if score < DISTANCE_THRESHOLD:
@@ -167,20 +189,46 @@ context = context[:MAX_CONTEXT_CHARS]
 
         if not docs:
             return "I could not find this information in the manual.", {
+                "model": self.last_model,
+                "category": self.last_category,
                 "confidence": "Low"
             }
 
-            # =========================
-            # GENERATE ANSWER
-            # =========================
-            context = "\n\n".join(d.page_content for d in docs)
-            context = context[:12000]  # prevent Groq overflow
-            
-            prompt = self.build_prompt(context, query)
-            response = self.llm.invoke(prompt)
+        # -------------------------
+        # Build context
+        # -------------------------
+        context = trim_context("\n\n".join(d.page_content for d in docs))
+
+        messages = [
+            HumanMessage(
+                content=f"""
+You are a professional technical assistant.
+Answer strictly using the manual content below.
+Do not invent information.
+
+Manual Context:
+{context}
+
+Question:
+{query}
+"""
+            )
+        ]
+
+        # -------------------------
+        # LLM call (safe)
+        # -------------------------
+        try:
+            response = self.llm.invoke(messages)
+        except Exception:
+            return "The system could not generate a response at the moment.", {
+                "model": self.last_model,
+                "category": self.last_category,
+                "confidence": "Low"
+            }
 
         return response.content, {
             "model": self.last_model,
             "category": self.last_category,
-            "confidence": confidence_from_distance(best_score)
+            "confidence": confidence_from_score(best_score)
         }
