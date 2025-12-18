@@ -176,7 +176,10 @@ Say that the manual does not contain this information.
         prompt = self.build_prompt(context, query)
 
         try:
-            response = self.llm.invoke(prompt)
+            response = self.llm.invoke(
+    [{"role": "user", "content": prompt}]
+)
+
         except Exception as e:
             return f"LLM error: {str(e)}", {}
 
