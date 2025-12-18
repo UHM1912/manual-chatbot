@@ -110,6 +110,9 @@ class ChatbotEngine:
             temperature=0,
             api_key=os.environ["GROQ_API_KEY"]
         )
+MAX_CONTEXT_CHARS = 12000  # safe for Groq
+
+context = context[:MAX_CONTEXT_CHARS]
 
     # -------------------------
     def build_prompt(self, context, question):
@@ -167,8 +170,14 @@ If the answer is not present, clearly say so.
                 "confidence": "Low"
             }
 
-        context = "\n\n".join(d.page_content for d in docs)
-        response = self.llm.invoke([HumanMessage(content=self.build_prompt(context, query))])
+# =========================
+# GENERATE ANSWER
+# =========================
+context = "\n\n".join(d.page_content for d in docs)
+context = context[:12000]  # prevent Groq overflow
+
+prompt = self.build_prompt(context, query)
+response = self.llm.invoke(prompt)
 
         return response.content, {
             "model": self.last_model,
