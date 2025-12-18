@@ -1,18 +1,28 @@
 from pathlib import Path
-import os
-
 from langchain_community.vectorstores import FAISS
 from langchain_huggingface import HuggingFaceEmbeddings
-from groq import Groq
-
+from langchain_groq import ChatGroq
+from langchain_core.messages import HumanMessage
+import os
 
 # =========================
 # CONFIG
 # =========================
 VECTOR_DIR = Path("vector_store")
-TOP_K = 5
-MAX_CONTEXT_CHARS = 4000   # Groq-safe
+TOP_K = 6
+DISTANCE_THRESHOLD = 1.3
 
+# Groq API key from environment
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+
+
+def confidence_from_distance(score: float):
+    if score < 0.7:
+        return "High"
+    elif score < 1.0:
+        return "Medium"
+    else:
+        return "Low"
 
 # =========================
 # MODEL & CATEGORY HELPERS
@@ -22,6 +32,8 @@ def detect_model(query: str):
     known_models = [
         "neopix 110", "neopix 750",
         "hc210",
+        "1000 series", "2000 series", "4000 series",
+        "5000 series", "7000 series", "8000 series",
         "nnsd681s", "nnsn968b",
         "lw5025r",
         "cmb110055", "rc759"
@@ -36,6 +48,12 @@ MODEL_MAP = {
     "neopix_110": "phillips_printer_neopix_110",
     "neopix_750": "phillips_printer_neopix_750_smart",
     "hc210": "phillips_headphones_hc210",
+    "1000_series": "phillips_headphones_1000_series",
+    "2000_series": "phillips_headphones_2000_series",
+    "4000_series": "phillips_headphones_4000_series",
+    "5000_series": "phillips_headphones_5000_series",
+    "7000_series": "phillips_headphones_7000_series",
+    "8000_series": "phillips_headphones_8000_series",
     "nnsd681s": "panasonic_microwave_nnsd681s",
     "nnsn968b": "panasonic_microwave_nnsn968b",
     "lw5025r": "lg_airconditioner_lw5025r",
@@ -46,18 +64,25 @@ MODEL_MAP = {
 
 def detect_category(query: str):
     q = query.lower()
-    if "projector" in q:
-        return "projector"
+
+    if "car" in q or "car system" in q or "stereo" in q:
+        return "carsystem"
+
+    if "airconditioner" in q or "air conditioner" in q or "ac" in q:
+        return "airconditioner"
+
+    if "microwave" in q or "oven" in q:
+        return "microwave"
+
     if "printer" in q:
         return "printer"
-    if "headphone" in q:
+
+    if "headphone" in q or "earphone" in q:
         return "headphones"
-    if "microwave" in q:
-        return "microwave"
-    if "air conditioner" in q or "ac" in q:
-        return "airconditioner"
-    if "car" in q:
-        return "carsystem"
+
+    if "projector" in q:
+        return "projector"
+
     return None
 
 
@@ -66,22 +91,12 @@ def detect_category(query: str):
 # =========================
 class ChatbotEngine:
     def __init__(self):
-        # --- session memory ---
         self.last_model = None
         self.last_category = None
 
-        # --- API key ---
-        if not os.getenv("GROQ_API_KEY"):
-            raise RuntimeError("GROQ_API_KEY not set")
-
-        # --- embeddings ---
         self.embeddings = HuggingFaceEmbeddings(
             model_name="sentence-transformers/all-MiniLM-L6-v2"
         )
-
-        # --- FAISS ---
-        if not (VECTOR_DIR / "index.faiss").exists():
-            raise RuntimeError("FAISS index not found in vector_store/")
 
         self.vectorstore = FAISS.load_local(
             VECTOR_DIR,
@@ -89,106 +104,123 @@ class ChatbotEngine:
             allow_dangerous_deserialization=True
         )
 
-        # --- Groq client ---
-        self.client = Groq(api_key=os.environ["GROQ_API_KEY"])
-
-    # -------------------------
-    def build_prompt(self, context: str, question: str) -> str:
-        return (
-            "You are a helpful technical assistant.\n\n"
-            "Answer the question using ONLY the information below.\n\n"
-            f"Context:\n{context}\n\n"
-            f"Question:\n{question}\n\n"
-            "If the answer is not explicitly available in the context, "
-            "clearly say so and briefly explain why."
+        # Initialize Groq LLM
+        self.llm = ChatGroq(
+            model="mixtral-8x7b-32768",  # or "llama2-70b-4096", "gemma-7b-it"
+            temperature=0,
+            api_key=GROQ_API_KEY
         )
 
     # -------------------------
+    def build_prompt(self, context, question):
+        return f"""
+Do not explain your reasoning.
+You are a helpful technical assistant.
+Answer the question using ONLY the information below.
+
+Context:
+{context}
+
+Question:
+{question}
+
+If the answer is not present in the context:
+- Clearly state that the information is not explicitly available
+- Briefly explain why (e.g., manual scope or model mismatch)
+- Do NOT repeat the sentence verbatim
+- Do NOT explain your reasoning process
+
+"""
+
+    # -------------------------
     def answer(self, query: str):
+        """
+        Main entry point for UI.
+        Returns:
+          answer_text (str),
+          meta (dict): current model/category
+        """
+
         detected_model = detect_model(query)
         detected_category = detect_category(query)
-
+        results = []
         # =========================
-        # RETRIEVAL
+        # CONTEXT SWITCHING LOGIC
         # =========================
         if detected_model and detected_model in MODEL_MAP:
+            # Exact model mentioned
             active_model = MODEL_MAP[detected_model]
             self.last_model = active_model
-            self.last_category = detected_category
+            self.last_category = None
 
             results = self.vectorstore.similarity_search_with_score(
                 query, k=TOP_K, filter={"model": active_model}
             )
 
-            # fallback → category
-            if not results and detected_category:
-                results = self.vectorstore.similarity_search_with_score(
-                    query, k=TOP_K, filter={"category": detected_category}
-                )
+        elif detected_category:
+            # Category switch (new product type)
+            self.last_category = detected_category
+            self.last_model = None
+
+            results = self.vectorstore.similarity_search_with_score(
+                query, k=TOP_K, filter={"category": detected_category}
+            )
+
+        elif self.last_model:
+            # Follow-up question
+            active_model = self.last_model
+
+            results = self.vectorstore.similarity_search_with_score(
+                query, k=TOP_K, filter={"model": active_model}
+            )
+
         else:
-            results = self.vectorstore.similarity_search_with_score(query, k=TOP_K)
+            # Global search fallback
+            results = self.vectorstore.similarity_search_with_score(
+                query, k=TOP_K
+            )
 
         if not results:
             return (
                 "I could not find this information in the manual.",
-                {"confidence": "Low"}
+                {
+                    "model": self.last_model,
+                    "category": self.last_category
+                }
             )
 
         # =========================
-        # SAFE CONTEXT BUILD (CRITICAL)
+        # FILTER BY CONFIDENCE
         # =========================
-        docs = [doc for doc, _ in results[:3]]
-        best_score = min(score for _, score in results[:3])
+        docs = []
+        best_score = None
 
-        context_parts = []
-        total_chars = 0
-
-        for d in docs:
-            chunk = d.page_content.strip()
-            if not chunk:
-                continue
-            if total_chars + len(chunk) > MAX_CONTEXT_CHARS:
-                break
-            context_parts.append(chunk)
-            total_chars += len(chunk)
-
-        context = "\n\n".join(context_parts)
-
-        # 🚨 Guard against empty context (Groq-safe)
-        if not context.strip():
+        for doc, score in results:
+            if best_score is None or score < best_score:
+                best_score = score
+            if score < DISTANCE_THRESHOLD:
+                docs.append(doc)
+          
+        # =========================
+        # NOTHING CONFIDENT ENOUGH
+        # =========================
+        if not docs:
             return (
-                "The manual does not contain relevant information for this question.",
-                {"confidence": "Low"}
+                "I could not find this information in the manual.",
+                {
+                    "model": self.last_model,
+                    "category": self.last_category,
+                    "confidence": "Low"
+                }
             )
 
+        # =========================
+        # GENERATE ANSWER
+        # =========================
+        context = "\n\n".join(d.page_content for d in docs)
         prompt = self.build_prompt(context, query)
-
-        # =========================
-        # GROQ CALL
-        # =========================
-        try:
-            completion = self.client.chat.completions.create(
-                model="llama3-8b-8192",
-                messages=[
-                    {"role": "user", "content": prompt}
-                ],
-                temperature=0,
-                max_tokens=384
-            )
-
-            answer_text = completion.choices[0].message.content.strip()
-
-        except Exception as e:
-            # log real Groq error
-            print("GROQ ERROR >>>", repr(e))
-            return (
-                "I could not generate an answer due to a model error.",
-                {"confidence": "Low"}
-            )
-
-        # =========================
-        # CONFIDENCE
-        # =========================
+        response = self.llm.invoke([HumanMessage(content=prompt)])
+         
         if best_score < 0.7:
             confidence = "High"
         elif best_score < 1.0:
@@ -196,4 +228,11 @@ class ChatbotEngine:
         else:
             confidence = "Low"
 
-        return answer_text, {"confidence": confidence}
+        return (
+            response.content,
+            {
+                "model": self.last_model,
+                "category": self.last_category,
+                "confidence": confidence
+            }
+        )
