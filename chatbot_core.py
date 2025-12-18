@@ -114,7 +114,7 @@ class ChatbotEngine:
 
     # -------------------------
     def call_groq_api(self, prompt: str):
-        """Direct HTTP call to Groq API to avoid dependency issues"""
+        """Direct HTTP call to Groq API with latest active model"""
         
         url = "https://api.groq.com/openai/v1/chat/completions"
         
@@ -123,6 +123,7 @@ class ChatbotEngine:
             "Content-Type": "application/json"
         }
         
+        # Using llama-3.1-70b-versatile (currently active model - December 2025)
         payload = {
             "model": "llama-3.1-70b-versatile",
             "messages": [
@@ -136,6 +137,7 @@ class ChatbotEngine:
             "top_p": 1.0
         }
         
+        logger.info(f"Calling Groq API with model: llama-3.1-70b-versatile")
         logger.debug(f"Groq API Request Payload: {json.dumps(payload, indent=2)}")
         
         try:
@@ -285,8 +287,8 @@ Answer:"""
             elif "429" in error_msg:
                 return ("⏳ Rate limit reached. Try again later.", 
                         {"model": self.last_model, "category": self.last_category, "confidence": "Low"})
-            elif "400" in error_msg:
-                return ("⚠️ Bad request. Check logs for details.", 
+            elif "400" in error_msg or "decommissioned" in error_msg.lower():
+                return ("⚠️ Model error. Check logs for details.", 
                         {"model": self.last_model, "category": self.last_category, "confidence": "Low"})
             else:
                 return (f"⚠️ Error: {error_msg[:100]}", 
