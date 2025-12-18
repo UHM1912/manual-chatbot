@@ -88,15 +88,10 @@ If the answer is not explicitly present in the context:
             )
 
         # --- filter by distance ---
-        docs = []
-        best_score = None
+       # Take top-k results directly (do NOT hard-filter by distance)
+        docs = [doc for doc, _ in results[:3]]
+        best_score = min(score for _, score in results[:3])
 
-        for doc, score in results:
-            if best_score is None or score < best_score:
-                best_score = score
-
-            if score < DISTANCE_THRESHOLD:
-                docs.append(doc)
 
         if not docs:
             return (
