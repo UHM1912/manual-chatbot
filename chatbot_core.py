@@ -84,7 +84,7 @@ If the answer is not present in the context:
 
         prompt = self.build_prompt(context, query)
 
-       response = self.llm.invoke(prompt)
+        response = self.llm.invoke(prompt)
 
 
         if best_score < 0.7:
