@@ -116,18 +116,18 @@ context = context[:MAX_CONTEXT_CHARS]
 
     # -------------------------
     def build_prompt(self, context, question):
-        return f"""
-You are a helpful technical assistant.
-Answer using ONLY the context below.
-
-Context:
-{context}
-
-Question:
-{question}
-
-If the answer is not present, clearly say so.
-"""
+                return f"""
+        You are a helpful technical assistant.
+        Answer using ONLY the context below.
+        
+        Context:
+        {context}
+        
+        Question:
+        {question}
+        
+        If the answer is not present, clearly say so.
+        """
 
     # -------------------------
     def answer(self, query: str):
