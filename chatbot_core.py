@@ -3,13 +3,8 @@ from langchain_community.vectorstores import FAISS
 from langchain_huggingface import HuggingFaceEmbeddings
 import os
 import streamlit as st
-import logging
-import json
 import requests
-
-# Setup logging
-logging.basicConfig(level=logging.DEBUG)
-logger = logging.getLogger(__name__)
+import json
 
 # =========================
 # CONFIG
@@ -17,17 +12,16 @@ logger = logging.getLogger(__name__)
 VECTOR_DIR = Path("vector_store")
 TOP_K = 6
 DISTANCE_THRESHOLD = 1.3
-
-# Groq API key from environment
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
 if not GROQ_API_KEY:
-    st.error("❌ GROQ_API_KEY not found. Please set it in Streamlit secrets.")
+    st.error("❌ GROQ_API_KEY not set")
     st.stop()
 
-logger.info(f"API Key loaded: {GROQ_API_KEY[:10]}...")
 
-
+# =========================
+# HELPERS
+# =========================
 def confidence_from_distance(score: float):
     if score < 0.7:
         return "High"
@@ -36,9 +30,7 @@ def confidence_from_distance(score: float):
     else:
         return "Low"
 
-# =========================
-# MODEL & CATEGORY HELPERS
-# =========================
+
 def detect_model(query: str):
     q = query.lower()
     known_models = [
@@ -76,7 +68,6 @@ MODEL_MAP = {
 
 def detect_category(query: str):
     q = query.lower()
-
     if "car" in q or "car system" in q or "stereo" in q:
         return "carsystem"
     if "airconditioner" in q or "air conditioner" in q or "ac" in q:
@@ -99,23 +90,125 @@ class ChatbotEngine:
     def __init__(self):
         self.last_model = None
         self.last_category = None
-
         self.embeddings = HuggingFaceEmbeddings(
             model_name="sentence-transformers/all-MiniLM-L6-v2"
         )
-
         self.vectorstore = FAISS.load_local(
             VECTOR_DIR,
             self.embeddings,
             allow_dangerous_deserialization=True
         )
 
-        logger.info("✅ ChatbotEngine initialized")
+    def answer(self, query: str):
+        detected_model = detect_model(query)
+        detected_category = detect_category(query)
+        results = []
 
-    # -------------------------
-    def call_groq_api(self, prompt: str):
-        """Direct HTTP call to Groq API with latest active model"""
+        if detected_model and detected_model in MODEL_MAP:
+            active_model = MODEL_MAP[detected_model]
+            self.last_model = active_model
+            self.last_category = None
+            results = self.vectorstore.similarity_search_with_score(
+                query, k=TOP_K, filter={"model": active_model}
+            )
+
+        elif detected_category:
+            self.last_category = detected_category
+            self.last_model = None
+            results = self.vectorstore.similarity_search_with_score(
+                query, k=TOP_K, filter={"category": detected_category}
+            )
+
+        elif self.last_model:
+            active_model = self.last_model
+            results = self.vectorstore.similarity_search_with_score(
+                query, k=TOP_K, filter={"model": active_model}
+            )
+
+        else:
+            results = self.vectorstore.similarity_search_with_score(query, k=TOP_K)
+
+        if not results:
+            return (
+                "I could not find this information in the manual.",
+                {
+                    "model": self.last_model,
+                    "category": self.last_category,
+                    "confidence": "Low"
+                }
+            )
+
+        docs = []
+        best_score = None
+
+        for doc, score in results:
+            if best_score is None or score < best_score:
+                best_score = score
+            if score < DISTANCE_THRESHOLD:
+                docs.append(doc)
+
+        if not docs:
+            return (
+                "I could not find relevant information in the manual.",
+                {
+                    "model": self.last_model,
+                    "category": self.last_category,
+                    "confidence": "Low"
+                }
+            )
+
+        context = "\n\n".join(d.page_content for d in docs)
         
+        if len(context) > 1000:
+            context = context[:1000]
+
+        prompt = f"""Answer the question using ONLY the provided context.
+
+Context:
+{context}
+
+Question: {query}
+
+Answer:"""
+
+        try:
+            response_text = self._call_groq(prompt)
+            
+            if best_score < 0.7:
+                confidence = "High"
+            elif best_score < 1.0:
+                confidence = "Medium"
+            else:
+                confidence = "Low"
+
+            return (
+                response_text,
+                {
+                    "model": self.last_model,
+                    "category": self.last_category,
+                    "confidence": confidence
+                }
+            )
+
+        except Exception as e:
+            error_msg = str(e)
+            if "401" in error_msg:
+                return (
+                    "❌ API key error",
+                    {"model": self.last_model, "category": self.last_category, "confidence": "Low"}
+                )
+            elif "429" in error_msg:
+                return (
+                    "⏳ Rate limit reached",
+                    {"model": self.last_model, "category": self.last_category, "confidence": "Low"}
+                )
+            else:
+                return (
+                    f"Error: {error_msg[:80]}",
+                    {"model": self.last_model, "category": self.last_category, "confidence": "Low"}
+                )
+
+    def _call_groq(self, prompt: str):
         url = "https://api.groq.com/openai/v1/chat/completions"
         
         headers = {
@@ -123,173 +216,18 @@ class ChatbotEngine:
             "Content-Type": "application/json"
         }
         
-        # Using llama-3.1-70b-versatile (currently active model - December 2025)
         payload = {
             "model": "llama-3.1-70b-versatile",
-            "messages": [
-                {
-                    "role": "user",
-                    "content": prompt
-                }
-            ],
+            "messages": [{"role": "user", "content": prompt}],
             "temperature": 0.3,
             "max_tokens": 300,
             "top_p": 1.0
         }
-        
-        logger.info(f"Calling Groq API with model: llama-3.1-70b-versatile")
-        logger.debug(f"Groq API Request Payload: {json.dumps(payload, indent=2)}")
-        
-        try:
-            response = requests.post(url, headers=headers, json=payload, timeout=30)
-            logger.info(f"Groq API Response Status: {response.status_code}")
-            
-            if response.status_code != 200:
-                error_detail = response.text
-                logger.error(f"Groq API Error: {error_detail}")
-                raise Exception(f"Groq API Error ({response.status_code}): {error_detail}")
-            
-            result = response.json()
-            logger.debug(f"Groq API Response: {json.dumps(result, indent=2)}")
-            
-            return result["choices"][0]["message"]["content"]
-            
-        except requests.exceptions.RequestException as e:
-            logger.error(f"Request Exception: {e}")
-            raise
-        except Exception as e:
-            logger.error(f"Unexpected error: {e}")
-            raise
 
-    # -------------------------
-    def build_prompt(self, context: str, question: str) -> str:
-        """Build a simple, safe prompt"""
-        return f"""Answer the question based ONLY on the provided context.
+        response = requests.post(url, headers=headers, json=payload, timeout=30)
 
-Context:
-{context}
+        if response.status_code != 200:
+            raise Exception(f"Groq API error: {response.text}")
 
-Question: {question}
-
-Answer:"""
-
-    # -------------------------
-    def answer(self, query: str):
-        """Main entry point for UI"""
-        
-        logger.info(f"Processing query: {query[:50]}")
-        
-        detected_model = detect_model(query)
-        detected_category = detect_category(query)
-        results = []
-        
-        # Context switching logic
-        try:
-            if detected_model and detected_model in MODEL_MAP:
-                active_model = MODEL_MAP[detected_model]
-                self.last_model = active_model
-                self.last_category = None
-                logger.info(f"Detected model: {active_model}")
-                
-                results = self.vectorstore.similarity_search_with_score(
-                    query, k=TOP_K, filter={"model": active_model}
-                )
-                
-            elif detected_category:
-                self.last_category = detected_category
-                self.last_model = None
-                logger.info(f"Detected category: {detected_category}")
-                
-                results = self.vectorstore.similarity_search_with_score(
-                    query, k=TOP_K, filter={"category": detected_category}
-                )
-                
-            elif self.last_model:
-                active_model = self.last_model
-                logger.info(f"Using previous model: {active_model}")
-                
-                results = self.vectorstore.similarity_search_with_score(
-                    query, k=TOP_K, filter={"model": active_model}
-                )
-                
-            else:
-                logger.info("Global search")
-                results = self.vectorstore.similarity_search_with_score(query, k=TOP_K)
-            
-            logger.info(f"Found {len(results)} results")
-            
-            if not results:
-                return (
-                    "No information found in manual.",
-                    {"model": self.last_model, "category": self.last_category, "confidence": "Low"}
-                )
-            
-            # Filter by confidence
-            docs = []
-            best_score = None
-            
-            for doc, score in results:
-                if best_score is None or score < best_score:
-                    best_score = score
-                if score < DISTANCE_THRESHOLD:
-                    docs.append(doc)
-            
-            if not docs:
-                return (
-                    "No relevant information found.",
-                    {"model": self.last_model, "category": self.last_category, "confidence": "Low"}
-                )
-            
-            # Build context and prompt
-            context = "\n\n".join(d.page_content for d in docs)
-            
-            # Aggressive truncation
-            if len(context) > 1000:
-                context = context[:1000]
-            
-            logger.info(f"Context length: {len(context)} chars")
-            
-            prompt = self.build_prompt(context, query)
-            logger.info(f"Prompt length: {len(prompt)} chars")
-            
-            # Call Groq API
-            try:
-                response_text = self.call_groq_api(prompt)
-                logger.info("✅ Got response from Groq")
-                
-                if best_score < 0.7:
-                    confidence = "High"
-                elif best_score < 1.0:
-                    confidence = "Medium"
-                else:
-                    confidence = "Low"
-                
-                return (
-                    response_text,
-                    {
-                        "model": self.last_model,
-                        "category": self.last_category,
-                        "confidence": confidence
-                    }
-                )
-                
-            except Exception as e:
-                logger.error(f"Groq API call failed: {str(e)}")
-                raise
-        
-        except Exception as e:
-            error_msg = str(e)
-            logger.error(f"Error in answer(): {error_msg}")
-            
-            if "401" in error_msg:
-                return ("❌ Authentication failed. Check API key.", 
-                        {"model": self.last_model, "category": self.last_category, "confidence": "Low"})
-            elif "429" in error_msg:
-                return ("⏳ Rate limit reached. Try again later.", 
-                        {"model": self.last_model, "category": self.last_category, "confidence": "Low"})
-            elif "400" in error_msg or "decommissioned" in error_msg.lower():
-                return ("⚠️ Model error. Check logs for details.", 
-                        {"model": self.last_model, "category": self.last_category, "confidence": "Low"})
-            else:
-                return (f"⚠️ Error: {error_msg[:100]}", 
-                        {"model": self.last_model, "category": self.last_category, "confidence": "Low"})
+        result = response.json()
+        return result["choices"][0]["message"]["content"]
