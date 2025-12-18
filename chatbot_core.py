@@ -84,7 +84,8 @@ If the answer is not present in the context:
 
         prompt = self.build_prompt(context, query)
 
-        response = self.llm.invoke(prompt)
+        response_text = self.llm.predict(prompt)
+
 
 
         if best_score < 0.7:
@@ -94,4 +95,5 @@ If the answer is not present in the context:
         else:
             confidence = "Low"
 
-        return response.content, {"confidence": confidence}
+        return response_text, {"confidence": confidence}
+
