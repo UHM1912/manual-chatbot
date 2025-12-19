@@ -1,8 +1,10 @@
 from pathlib import Path
 from langchain_community.vectorstores import FAISS
 from langchain_huggingface import HuggingFaceEmbeddings
-from langchain_community.chat_models import ChatOllama
-from langchain_core.messages import HumanMessage
+import os
+import streamlit as st
+import requests
+import json
 
 # =========================
 # CONFIG
@@ -10,34 +12,25 @@ from langchain_core.messages import HumanMessage
 VECTOR_DIR = Path("vector_store")
 TOP_K = 6
 DISTANCE_THRESHOLD = 1.3
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+
+if not GROQ_API_KEY:
+    st.error("❌ GROQ_API_KEY not set")
+    st.stop()
+
 
 # =========================
-# MEMORY
+# HELPERS
 # =========================
-last_model = None
-last_category = None
+def confidence_from_distance(score: float):
+    if score < 0.7:
+        return "High"
+    elif score < 1.0:
+        return "Medium"
+    else:
+        return "Low"
 
-# =========================
-# PROMPT
-# =========================
-def build_prompt(context, question):
-    return f"""
-You are a helpful technical assistant.
-Answer the question using ONLY the information below.
 
-Context:
-{context}
-
-Question:
-{question}
-
-If the answer is not present in the context, say:
-"I could not find this information in the manual."
-"""
-
-# =========================
-# MODEL DETECTION
-# =========================
 def detect_model(query: str):
     q = query.lower()
     known_models = [
@@ -72,135 +65,172 @@ MODEL_MAP = {
     "rc759": "phillips_car_system_rc759_rds"
 }
 
-# =========================
-# CATEGORY DETECTION (FIXED)
-# =========================
+
 def detect_category(query: str):
     q = query.lower()
-
     if "car" in q or "car system" in q or "stereo" in q:
         return "carsystem"
-
     if "airconditioner" in q or "air conditioner" in q or "ac" in q:
         return "airconditioner"
-
     if "microwave" in q or "oven" in q:
         return "microwave"
-
     if "printer" in q:
         return "printer"
-
     if "headphone" in q or "earphone" in q:
         return "headphones"
-
     if "projector" in q:
         return "projector"
-
-    if "sound" in q or "speaker":
-        return "soundsystem"
-
     return None
 
+
 # =========================
-# MAIN
+# CHATBOT ENGINE
 # =========================
-def main():
-    global last_model, last_category
+class ChatbotEngine:
+    def __init__(self):
+        self.last_model = None
+        self.last_category = None
+        self.embeddings = HuggingFaceEmbeddings(
+            model_name="sentence-transformers/all-MiniLM-L6-v2"
+        )
+        self.vectorstore = FAISS.load_local(
+            VECTOR_DIR,
+            self.embeddings,
+            allow_dangerous_deserialization=True
+        )
 
-    embeddings = HuggingFaceEmbeddings(
-        model_name="sentence-transformers/all-MiniLM-L6-v2"
-    )
-
-    vectorstore = FAISS.load_local(
-        VECTOR_DIR,
-        embeddings,
-        allow_dangerous_deserialization=True
-    )
-
-    llm = ChatOllama(model="llama3", temperature=0)
-
-    print("\n📘 Manual Chatbot Ready (type 'exit' to quit)\n")
-
-    while True:
-        query = input("You: ").strip()
-
-        if query.lower() in ["exit", "quit"]:
-            print("👋 Bye!")
-            break
-
+    def answer(self, query: str):
         detected_model = detect_model(query)
         detected_category = detect_category(query)
+        results = []
 
-        # =========================
-        # CONTEXT SWITCH LOGIC (KEY FIX)
-        # =========================
         if detected_model and detected_model in MODEL_MAP:
-            # Exact model → strongest
             active_model = MODEL_MAP[detected_model]
-            last_model = active_model
-            last_category = None
-            print(f"🧠 Using model context: {active_model}")
-
-            results = vectorstore.similarity_search_with_score(
+            self.last_model = active_model
+            self.last_category = None
+            results = self.vectorstore.similarity_search_with_score(
                 query, k=TOP_K, filter={"model": active_model}
             )
 
         elif detected_category:
-            # Category switch → reset old model
-            last_model = None
-            last_category = detected_category
-            print(f"🧠 Switching to category: {detected_category}")
-
-            results = vectorstore.similarity_search_with_score(
+            self.last_category = detected_category
+            self.last_model = None
+            results = self.vectorstore.similarity_search_with_score(
                 query, k=TOP_K, filter={"category": detected_category}
             )
 
-        elif last_model:
-            # Follow-up
-            print(f"🧠 Reusing previous model: {last_model}")
-            results = vectorstore.similarity_search_with_score(
-                query, k=TOP_K, filter={"model": last_model}
+        elif self.last_model:
+            active_model = self.last_model
+            results = self.vectorstore.similarity_search_with_score(
+                query, k=TOP_K, filter={"model": active_model}
             )
 
         else:
-            # Global fallback
-            print("🧠 Global search")
-            results = vectorstore.similarity_search_with_score(query, k=TOP_K)
+            results = self.vectorstore.similarity_search_with_score(query, k=TOP_K)
 
         if not results:
-            print("Bot: I could not find this information in the manual.")
-            continue
-
-        # =========================
-        # FILTER RESULTS
-        # =========================
-        print("\n🔍 Similarity Search Results:")
-        docs = []
-
-        for i, (doc, score) in enumerate(results, 1):
-            print(
-                f"{i}️⃣ Distance: {score:.4f} | "
-                f"Model: {doc.metadata.get('model')} | "
-                f"Category: {doc.metadata.get('category')}"
+            return (
+                "I could not find this information in the manual.",
+                {
+                    "model": self.last_model,
+                    "category": self.last_category,
+                    "confidence": "Low",
+                    "similarity_score": 0.0
+                }
             )
 
+        docs = []
+        best_score = None
+
+        for doc, score in results:
+            if best_score is None or score < best_score:
+                best_score = score
             if score < DISTANCE_THRESHOLD:
                 docs.append(doc)
 
         if not docs:
-            print("\nBot: I could not find this information in the manual.")
-            continue
+            return (
+                "I could not find relevant information in the manual.",
+                {
+                    "model": self.last_model,
+                    "category": self.last_category,
+                    "confidence": "Low",
+                    "similarity_score": round(best_score, 3) if best_score else 0.0
+                }
+            )
 
-        # =========================
-        # ANSWER
-        # =========================
         context = "\n\n".join(d.page_content for d in docs)
-        prompt = build_prompt(context, query)
-        response = llm.invoke([HumanMessage(content=prompt)])
+        
+        if len(context) > 1000:
+            context = context[:1000]
 
-        print("\nBot:", response.content)
-        print("-" * 70)
+        prompt = f"""Answer the question using ONLY the provided context.
 
+Context:
+{context}
 
-if __name__ == "__main__":
-    main()
+Question: {query}
+
+Answer:"""
+
+        try:
+            response_text = self._call_groq(prompt)
+            
+            if best_score < 0.7:
+                confidence = "High"
+            elif best_score < 1.0:
+                confidence = "Medium"
+            else:
+                confidence = "Low"
+
+            return (
+                response_text,
+                {
+                    "model": self.last_model,
+                    "category": self.last_category,
+                    "confidence": confidence,
+                    "similarity_score": round(best_score, 3)
+                }
+            )
+
+        except Exception as e:
+            error_msg = str(e)
+            if "401" in error_msg:
+                return (
+                    "❌ API key error",
+                    {"model": self.last_model, "category": self.last_category, "confidence": "Low", "similarity_score": 0.0}
+                )
+            elif "429" in error_msg:
+                return (
+                    "⏳ Rate limit reached",
+                    {"model": self.last_model, "category": self.last_category, "confidence": "Low", "similarity_score": 0.0}
+                )
+            else:
+                return (
+                    f"Error: {error_msg[:80]}",
+                    {"model": self.last_model, "category": self.last_category, "confidence": "Low", "similarity_score": 0.0}
+                )
+
+    def _call_groq(self, prompt: str):
+        url = "https://api.groq.com/openai/v1/chat/completions"
+        
+        headers = {
+            "Authorization": f"Bearer {GROQ_API_KEY}",
+            "Content-Type": "application/json"
+        }
+        
+        payload = {
+            "model": "llama-3.1-8b-instant",
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": 0.3,
+            "max_tokens": 300,
+            "top_p": 1.0
+        }
+
+        response = requests.post(url, headers=headers, json=payload, timeout=30)
+
+        if response.status_code != 200:
+            raise Exception(f"Groq API error: {response.text}")
+
+        result = response.json()
+        return result["choices"][0]["message"]["content"]
