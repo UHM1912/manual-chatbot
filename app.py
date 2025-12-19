@@ -237,6 +237,38 @@ st.markdown("""
         color: #991b1b;
     }
     
+    /* Metrics Container */
+    .metrics-container {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 15px;
+        margin-bottom: 15px;
+    }
+    
+    .metric-card {
+        background: linear-gradient(135deg, #eff6ff 0%, #e0f2fe 100%);
+        border: 2px solid #bae6fd;
+        border-radius: 12px;
+        padding: 16px;
+        text-align: center;
+        box-shadow: 0 2px 8px rgba(6, 182, 212, 0.1);
+    }
+    
+    .metric-label {
+        font-size: 0.75rem;
+        color: #0c4a6e;
+        font-weight: 700;
+        text-transform: uppercase;
+        letter-spacing: 0.5px;
+        margin-bottom: 8px;
+    }
+    
+    .metric-value {
+        font-size: 1.5rem;
+        color: #0369a1;
+        font-weight: 800;
+    }
+    
     /* Scrollbar */
     ::-webkit-scrollbar {
         width: 10px;
@@ -409,25 +441,38 @@ if user_query:
     with st.spinner("🔍 Searching manual database..."):
         answer, meta = st.session_state.bot.answer(user_query)
         confidence = meta.get("confidence", "Unknown")
+        similarity_score = meta.get("similarity_score", 0.0)
     
     # Add assistant message
     st.session_state.chat_history.append(
         {"role": "assistant", "content": answer}
     )
     
-    # Display confidence
-    confidence_map = {
-        "High": "status-high",
-        "Medium": "status-medium",
-        "Low": "status-low"
-    }
+    # Display metrics in two columns
+    col1, col2 = st.columns(2)
     
-    status_class = confidence_map.get(confidence, "status-low")
+    with col1:
+        confidence_map = {
+            "High": "🟢",
+            "Medium": "🟡",
+            "Low": "🔴"
+        }
+        icon = confidence_map.get(confidence, "⚪")
+        st.markdown(f"""
+        <div class="metric-card">
+            <div class="metric-label">📊 Confidence Level</div>
+            <div class="metric-value">{icon} {confidence}</div>
+        </div>
+        """, unsafe_allow_html=True)
     
-    st.markdown(f"""
-    <div class="status-box {status_class}">
-        ✓ Confidence: {confidence}
-    </div>
-    """, unsafe_allow_html=True)
+    with col2:
+        st.markdown(f"""
+        <div class="metric-card">
+            <div class="metric-label">🎯 Similarity Score</div>
+            <div class="metric-value">{similarity_score:.3f}</div>
+        </div>
+        """, unsafe_allow_html=True)
+    
+    st.divider()
     
     st.rerun()
