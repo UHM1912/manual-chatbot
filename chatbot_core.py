@@ -1,39 +1,35 @@
 from pathlib import Path
+import os
+import requests
 from langchain_community.vectorstores import FAISS
 from langchain_huggingface import HuggingFaceEmbeddings
-import os
-import streamlit as st
-import requests
-import json
 
 # =========================
 # CONFIG
 # =========================
 VECTOR_DIR = Path("vector_store")
 TOP_K = 6
-DISTANCE_THRESHOLD = 1.3
-GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+MAX_CONTEXT_CHARS = 1200
 
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 if not GROQ_API_KEY:
-    st.error("❌ GROQ_API_KEY not set")
-    st.stop()
+    raise RuntimeError("❌ GROQ_API_KEY is not set")
 
 
 # =========================
 # HELPERS
 # =========================
-def confidence_from_distance(score: float):
+def confidence_from_score(score: float) -> str:
     if score < 0.7:
         return "High"
     elif score < 1.0:
         return "Medium"
-    else:
-        return "Low"
+    return "Low"
 
 
 def detect_model(query: str):
     q = query.lower()
-    known_models = [
+    models = [
         "neopix 110", "neopix 750",
         "hc210",
         "1000 series", "2000 series", "4000 series",
@@ -42,7 +38,7 @@ def detect_model(query: str):
         "lw5025r",
         "cmb110055", "rc759"
     ]
-    for m in known_models:
+    for m in models:
         if m in q:
             return m.replace(" ", "_")
     return None
@@ -68,14 +64,14 @@ MODEL_MAP = {
 
 def detect_category(query: str):
     q = query.lower()
-    if "car" in q or "car system" in q or "stereo" in q:
-        return "carsystem"
-    if "airconditioner" in q or "air conditioner" in q or "ac" in q:
-        return "airconditioner"
-    if "microwave" in q or "oven" in q:
-        return "microwave"
     if "printer" in q:
         return "printer"
+    if "microwave" in q or "oven" in q:
+        return "microwave"
+    if "air conditioner" in q or "ac" in q:
+        return "airconditioner"
+    if "car" in q or "stereo" in q:
+        return "carsystem"
     if "headphone" in q or "earphone" in q:
         return "headphones"
     if "projector" in q:
@@ -90,39 +86,44 @@ class ChatbotEngine:
     def __init__(self):
         self.last_model = None
         self.last_category = None
+
         self.embeddings = HuggingFaceEmbeddings(
             model_name="sentence-transformers/all-MiniLM-L6-v2"
         )
+
         self.vectorstore = FAISS.load_local(
             VECTOR_DIR,
             self.embeddings,
             allow_dangerous_deserialization=True
         )
 
+    # -------------------------
     def answer(self, query: str):
         detected_model = detect_model(query)
         detected_category = detect_category(query)
-        results = []
 
+        # =========================
+        # RETRIEVAL STRATEGY
+        # =========================
         if detected_model and detected_model in MODEL_MAP:
-            active_model = MODEL_MAP[detected_model]
-            self.last_model = active_model
+            self.last_model = MODEL_MAP[detected_model]
             self.last_category = None
+
             results = self.vectorstore.similarity_search_with_score(
-                query, k=TOP_K, filter={"model": active_model}
+                query, k=TOP_K, filter={"model": self.last_model}
             )
 
         elif detected_category:
             self.last_category = detected_category
             self.last_model = None
+
             results = self.vectorstore.similarity_search_with_score(
                 query, k=TOP_K, filter={"category": detected_category}
             )
 
         elif self.last_model:
-            active_model = self.last_model
             results = self.vectorstore.similarity_search_with_score(
-                query, k=TOP_K, filter={"model": active_model}
+                query, k=TOP_K, filter={"model": self.last_model}
             )
 
         else:
@@ -132,102 +133,78 @@ class ChatbotEngine:
             return (
                 "I could not find this information in the manual.",
                 {
+                    "confidence": "Low",
+                    "similarity_score": 1.5,
                     "model": self.last_model,
-                    "category": self.last_category,
-                    "confidence": "Low"
+                    "category": self.last_category
                 }
             )
 
+        # =========================
+        # SELECT BEST DOCUMENTS
+        # =========================
         docs = []
         best_score = None
 
-        for doc, score in results:
+        for doc, score in results[:3]:
+            docs.append(doc)
             if best_score is None or score < best_score:
                 best_score = score
-            if score < DISTANCE_THRESHOLD:
-                docs.append(doc)
-
-        if not docs:
-            return (
-                "I could not find relevant information in the manual.",
-                {
-                    "model": self.last_model,
-                    "category": self.last_category,
-                    "confidence": "Low"
-                }
-            )
 
         context = "\n\n".join(d.page_content for d in docs)
-        
-        if len(context) > 1000:
-            context = context[:1000]
+        context = context[:MAX_CONTEXT_CHARS]
 
-        prompt = f"""Answer the question using ONLY the provided context.
+        # =========================
+        # PROMPT
+        # =========================
+        prompt = f"""
+You are a technical assistant.
+
+Answer the question using ONLY the information below.
 
 Context:
 {context}
 
-Question: {query}
+Question:
+{query}
 
-Answer:"""
+If the answer is not present in the context, clearly say so.
+"""
 
-        try:
-            response_text = self._call_groq(prompt)
-            
-            if best_score < 0.7:
-                confidence = "High"
-            elif best_score < 1.0:
-                confidence = "Medium"
-            else:
-                confidence = "Low"
+        # =========================
+        # GROQ CALL (SUPPORTED MODEL)
+        # =========================
+        response_text = self._call_groq(prompt)
 
-            return (
-                response_text,
-                {
-                    "model": self.last_model,
-                    "category": self.last_category,
-                    "confidence": confidence
-                }
-            )
+        return (
+            response_text,
+            {
+                "model": self.last_model,
+                "category": self.last_category,
+                "confidence": confidence_from_score(best_score),
+                "similarity_score": round(float(best_score), 3)
+            }
+        )
 
-        except Exception as e:
-            error_msg = str(e)
-            if "401" in error_msg:
-                return (
-                    "❌ API key error",
-                    {"model": self.last_model, "category": self.last_category, "confidence": "Low"}
-                )
-            elif "429" in error_msg:
-                return (
-                    "⏳ Rate limit reached",
-                    {"model": self.last_model, "category": self.last_category, "confidence": "Low"}
-                )
-            else:
-                return (
-                    f"Error: {error_msg[:80]}",
-                    {"model": self.last_model, "category": self.last_category, "confidence": "Low"}
-                )
-
-    def _call_groq(self, prompt: str):
+    # -------------------------
+    def _call_groq(self, prompt: str) -> str:
         url = "https://api.groq.com/openai/v1/chat/completions"
-        
+
         headers = {
             "Authorization": f"Bearer {GROQ_API_KEY}",
             "Content-Type": "application/json"
         }
-        
+
         payload = {
-            "model": "llama-3.1-8b-instant",
+            "model": "llama-3.1-8b-instant",  # ✅ ACTIVE MODEL
             "messages": [{"role": "user", "content": prompt}],
             "temperature": 0.3,
-            "max_tokens": 300,
-            "top_p": 1.0
+            "max_tokens": 300
         }
 
-        response = requests.post(url, headers=headers, json=payload, timeout=30)
+        res = requests.post(url, headers=headers, json=payload, timeout=30)
 
-        if response.status_code != 200:
-            raise Exception(f"Groq API error: {response.text}")
+        if res.status_code != 200:
+            raise RuntimeError(res.text)
 
-        result = response.json()
-        return result["choices"][0]["message"]["content"]
+        return res.json()["choices"][0]["message"]["content"]
