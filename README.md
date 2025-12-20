@@ -85,7 +85,7 @@ This helps users understand how closely the answer matches the manual content.
 ## 📸 Screenshots
 
 ### 🖥️ Main Chat Interface
-![Chat Interface](screenshots/chat_interface.png)
+![Chat Interface](chat_interface.png)
 
 
 
